@@ -688,6 +688,24 @@ if __name__ == "__main__":
 
         orig_output, new_output = transform(gm, example_args, patterns=vector_stages)
         compile(gm, example_args, **compile_args)
+    elif args.model == "fakeconv2d":
+        class SimpleConv2d(torch.nn.Module):
+            def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+                super(SimpleConv2d, self).__init__()
+                self.conv = torch.nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
+
+            def forward(self, x):
+                return self.conv(x)
+
+        model = SimpleConv2d(128, 64, kernel_size=3, stride=1, padding=1).eval().bfloat16()
+
+        example_args = (torch.randn(1, 128, 8, 8, dtype=torch_dtype),)
+        gm = prepare_pt2e(model, quantizer, example_args)
+
+        convert_pt2e(gm, args.bias)
+
+        orig_output, new_output = transform(gm, example_args, patterns=vector_stages)
+        compile(gm, example_args, **compile_args)
     else:
         raise ValueError(f"Model {args.model} not supported")
 
