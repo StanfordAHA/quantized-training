@@ -8,7 +8,6 @@ from torch.fx import Node
 from torch.fx.operator_schemas import normalize_function
 
 from .param_pb2 import Argument, Memory, OpOverload, Tensor
-from ..pt2e_utils import dtype_byte_size
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +29,11 @@ def register_save_function(custom_function):
 
 
 def _save_tensor(tensor, filename):
-    tensor = tensor.float().flatten()
-    packed_data = struct.pack(f'{tensor.numel()}f', *tensor.tolist())
+    t = tensor.float().flatten()
+    packed_data = struct.pack(f'{t.numel()}f', *t.tolist())
     with open(filename, 'wb') as f:
         f.write(packed_data)
-    print(f"Writing tensor to {filename}")
+    print(f"Writing tensor with shape {tuple(tensor.shape)} to {filename}")
 
 
 def save_tensor(tensor, filename):
@@ -48,75 +47,136 @@ def save_tensor(tensor, filename):
         _save_tensor(tensor, filename)
 
 
+def get_new_node_name_with_prefix(prefix, directory):
+    """
+    Generate a new attribute name with a given prefix that is not already used in the module's graph.
+    """
+    prefix = prefix.replace(".", "_")
+    if directory is None or not os.path.isdir(directory):
+        return prefix
+
+    def get_node_name(i: int):
+        return f"{prefix}_{i}" if i > 0 else prefix
+    i = 0
+    node_name = get_node_name(i)
+    while os.path.isfile(os.path.join(directory, node_name + ".bin")):
+        i += 1
+        node_name = get_node_name(i)
+        logger.debug(f"Node name {node_name} already exists, trying a new one...")
+    return node_name
+
+
 def set_tensor_field(field, node, output_dir=None, is_output=False):
     assert isinstance(node, Node) and hasattr(node, 'value'), (
         f"Expected node {node} has value attribute."
     )
 
-    reshape_node = node.meta.get("reshape")
-    is_reshape_fused_with_last_op = node.op == "call_module" and not is_output
+    original_node = node
 
-    if reshape_node is not None and not is_reshape_fused_with_last_op:
+    if (
+        (reshape_node := node.meta.get("reshape")) is not None and
+        not (node.op == "call_module" and not is_output)
+    ):
         field.reshape.CopyFrom(map_node(reshape_node))
         field.reshape.kwargs["output_shape"].int_list.values.extend(node.shape)
-        if not is_output:
-            node = reshape_node.args[0]
-    elif (getitem_node := node.meta.get("slicing")) is not None:
+        node = reshape_node.args[0] if not is_output else node
+
+    if (getitem_node := node.meta.get("slicing")) is not None:
         field.reshape.CopyFrom(map_node(getitem_node))
         field.reshape.kwargs["output_shape"].int_list.values.extend(node.shape)
         node = getitem_node.args[0]
 
-    if (dq_scale := node.meta.get("dq_scale", None)) is not None:
-        field.scale = dq_scale
+    if (dequantize_scale := node.meta.get("dq_scale")) is not None:
+        field.scale = dequantize_scale
         node = node.args[0]
 
-    if (source_node := node.meta.get("source_node", None)) is not None:
+    if (source_node := node.meta.get("source_node")) is not None:
         node = source_node
 
-    field.node = node.name
-    field.shape.extend(list(node.shape) or [1])
+    if (tiled_shape := original_node.meta.get("shape")) is not None:
+        field.node = (
+            node.name + "_tiled" if is_output else
+            get_new_node_name_with_prefix(node.name + "_tiled", output_dir)
+        )
+        field.shape.extend(list(tiled_shape))
+    else:
+        field.node = node.name
+        field.shape.extend(list(node.shape) or [1])
 
-    if (dtype := node.meta.get("dtype", None)) is not None:
+    if (dtype := node.meta.get("dtype")) is not None:
         field.dtype = dtype
     else:
         field.dtype = str(node.value.dtype).split(".")[1]
 
-    if (memory := node.meta.get("memory", None)) is not None:
+    if (memory := node.meta.get("memory")) is not None:
         field.memory.partition = memory.partition_id
         field.memory.address = memory.start
 
-    if output_dir is not None:
+    if (scratchpad := original_node.meta.get("scratchpad")) is not None:
+        field.scratchpad.offset = scratchpad.start
+
+    if tiled_shape is not None and not is_output and output_dir is not None:
+        n = len(tiled_shape)
+        slices = tuple(
+            [slice(None)] * (node.value.ndim - n) + [slice(0, s) for s in tiled_shape]
+        )
+        save_tensor(
+            node.value[slices], os.path.join(output_dir, f"{field.node}.bin")
+        )
+    elif output_dir is not None:
         save_tensor(node.value, os.path.join(output_dir, f"{node.name}.bin"))
 
 
 def set_output_field(param, node, output_dir):
     if isinstance(node.value, torch.Tensor):
-         set_tensor_field(param.output, node, output_dir, True)
+        if "tiled_shapes" in node.meta:
+            node.meta["shape"] = node.meta["tiled_shapes"].get(node)
+
+        if "scratchpad_mem" in node.meta:
+            node.meta["scratchpad"] = node.meta["scratchpad_mem"].get(node)
+
+        set_tensor_field(param.output, node, output_dir, True)
+    
+        node.meta.pop("shape", None)
+        node.meta.pop("scratchpad", None)
     elif isinstance(node.value, (tuple, list)):
-        partition = node.meta["memory"].partition_id
-        address = node.meta["memory"].start
+        if (memory := node.meta.get("memory")) is not None:
+            partition = memory.partition_id
+            address = memory.start
 
-        dtypes = [str(t.dtype).split(".")[1] for t in node.value]
-        if "dtype" in node.meta:
-            dtypes = [dt or dtypes[i] for i, dt in enumerate(node.meta["dtype"])]
+        if (scratchpad_mem := node.meta.get("scratchpad_mem")) is not None:
+            offset = scratchpad_mem[node].start
 
-        for i, tensor in enumerate(node.value):
-            param.outputs.tensors.append(Tensor(
-                node=f"{node.name}_{i}",
-                shape=list(tensor.shape),
-                dtype=dtypes[i],
-                memory=Memory(partition=partition, address=int(address)),
-            ))
+        if (tiled_shape := node.meta.get("tiled_shapes")) is not None:
+            shapes = tiled_shape[node]
 
-            address += tensor.numel() * dtype_byte_size(dtypes[i])
+        dtypes = node.meta.get("dtype", [None] * len(node.value))
+
+        for i, t in enumerate(node.value):
+            tensor = Tensor(
+                node=f"{node.name}_{i}_tiled" if tiled_shape else f"{node.name}_{i}",
+                shape=shapes[i] if tiled_shape else list(t.shape),
+                dtype=dtypes[i] or str(t.dtype).split(".")[1],
+            )
+
+            if memory is not None:
+                tensor.memory.partition = partition
+                tensor.memory.address = int(address)
+                address += node.meta["output_sizes"][i]
+
+            if scratchpad_mem is not None:
+                tensor.scratchpad.offset = int(offset)
+                offset += node.meta["tiled_output_sizes"][i]
 
             if output_dir is not None:
-                save_tensor(tensor, os.path.join(output_dir, f"{node.name}_{i}.bin"))
+                save_tensor(t, os.path.join(output_dir, f"{node.name}_{i}.bin"))
+
+            param.outputs.tensors.append(tensor)
     else:
         logger.warning(f"Unsupported output type: {type(node.value)}")
 
 
-def convert_arg(value) -> Argument:
+def convert_arg(value, output_dir=None) -> Argument:
     """
     Converts an argument (which could be a Tensor, list, int, float, etc.)
     into an Argument protobuf.
@@ -125,7 +185,7 @@ def convert_arg(value) -> Argument:
 
     if isinstance(value, torch.fx.Node):
         if isinstance(value.value, torch.Tensor):
-            set_tensor_field(arg.tensor, value)
+            set_tensor_field(arg.tensor, value, output_dir)
         elif isinstance(value.value, (tuple, list)):
             arg.tensor_list.tensors.extend([
                 Tensor(node=f"{value.name}_{i}") for i in range(len(value.value))
@@ -180,6 +240,9 @@ def map_node(node: torch.fx.Node, output_dir=None) -> OpOverload:
     if _is_nop(node) or is_addressing_op(node) or node.target == operator.getitem:
         op_overload.op = "nop"
 
+    if node.target == torch.ops.aten.pad.default:
+        op_overload.op = "cpu"
+
     new_args_and_kwargs = normalize_function(
         node.target, node.args, node.kwargs, normalize_to_only_use_kwargs=True
     )
@@ -193,10 +256,31 @@ def map_node(node: torch.fx.Node, output_dir=None) -> OpOverload:
     for arg in args:
         op_overload.args.append(convert_arg(arg))
 
+    tiled_shapes = node.meta.get("tiled_shapes")
+    scratchpad_mem = node.meta.get("scratchpad_mem")
+
     # Convert keyword arguments
     for key, value in kwargs.items():
-        if "code" not in key and value is not None:
-            op_overload.kwargs[key].CopyFrom(convert_arg(value))
+        if key in ["code", "scale_code"] or value is None:
+            continue
+
+        if isinstance(value, torch.fx.Node):
+            n = value.meta.get("input_node", value)
+            n = n.meta.get("source_node", n)
+            if tiled_shapes is not None:
+                value.meta["shape"] = tiled_shapes.get(n)
+
+            if scratchpad_mem is not None:
+                value.meta["scratchpad"] = scratchpad_mem.get(n)
+
+        op_overload.kwargs[key].CopyFrom(convert_arg(value, output_dir))
+
+        if isinstance(value, torch.fx.Node):
+            value.meta.pop("shape", None)
+            value.meta.pop("scratchpad", None)
+
+    if "l2_tiling" in node.meta:
+        op_overload.kwargs["l2_tiling"].int_list.values.extend(node.meta["l2_tiling"])
 
     return op_overload
 
@@ -206,8 +290,17 @@ def _is_gemm_op(node: Node) -> bool:
         torch.ops.aten.conv2d.default,
         torch.ops.aten.linear.default,
         torch.ops.aten.matmul.default,
+        torch.ops.quantized_ops.conv2d.default,
+        torch.ops.quantized_ops.linear.default,
         torch.ops.quantized_ops.conv2d_mx.default,
         torch.ops.quantized_ops.linear_mx.default,
+        torch.ops.quantized_ops.matmul_mx.default,
+    ]
+
+
+def _is_matmul(node: Node) -> bool:
+    return node.target in [
+        torch.ops.aten.matmul.default,
         torch.ops.quantized_ops.matmul_mx.default,
     ]
 
@@ -341,10 +434,20 @@ def _is_nop(node: Node) -> bool:
     """
     # A slice from 0 to the end of the input tensor
     if node.target == torch.ops.aten.slice.Tensor:
-        input_shape = node.args[0].shape
         default_args = [0, None, None, 1]
         dim, start, end, step = list(node.args[1:]) + default_args[len(node.args) - 1:]
-        return start == 0 and end > input_shape[dim] and step == 1
+        if start != 0 or step != 1:
+            return False
+        if hasattr(node.args[0], "shape"):
+            return end > node.args[0].shape[dim]
+        return end == 0x7fffffffffffffff
+
+    # A select operation that selects the entire tensor
+    if node.target == torch.ops.aten.select.int:
+        return node.args[0].shape[node.args[1]] == 1
+
+    if node.target == torch.ops.aten.expand.default:
+        return all(x == 1 or x == -1 for x in node.args[1])
 
     return node.target in [
         torch.ops.aten.clone.default,
@@ -355,6 +458,7 @@ def _is_nop(node: Node) -> bool:
         torch.ops.aten.reshape.default,
         torch.ops.aten.squeeze.dim,
         torch.ops.aten.squeeze.dims,
+        torch.ops.aten.to.dtype,
         torch.ops.aten.unsqueeze.default,
         torch.ops.aten.view.default,
     ]
