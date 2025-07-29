@@ -137,20 +137,21 @@ def transform(
     # Move quantize and dequantize ops to the end of last compute op
     fuse_quantize_dequantize_with_previous_op(model)
 
-    if unroll_dims is not None:
-        pad_conv2d_inputs_to_hardware_unroll_size(model, *unroll_dims)
-
     if conv2d_im2col:
         replace_conv2d_with_im2col(model)
+
+    if unroll_dims is not None:
+        pad_gemm_inputs_to_hardware_unroll_size(model, *unroll_dims)
+        ShapeProp(model).propagate(*flatten_args)
 
     if cache_size is not None:
         run_matrix_op_l2_tiling(model, unroll_dims, cache_size)
         run_vector_op_l2_tiling(model, unroll_dims, cache_size)
 
     if transpose_weight:
-        transpose_conv2d_weights(model)
-        transpose_linear_weights(model, transpose_fc=transpose_fc)
+        transpose_conv2d_inputs_and_weights(model)
         replace_target(model, TRANSPOSED_OPERATORS)
+        transpose_linear_weights(model, transpose_fc=transpose_fc)
 
         ShapeProp(model).propagate(*flatten_args)
 

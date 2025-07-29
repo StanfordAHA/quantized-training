@@ -17,7 +17,6 @@ __all__ = [
     "get_conv_bn_layers",
     "pad_gemm_inputs_to_hardware_unroll_size",
     "pad_vit_embeddings_output",
-    "pad_conv2d_inputs_to_hardware_unroll_size",
     "replace_conv2d_with_im2col",
     "replace_target_with_vmap",
     "replace_interpolate",
@@ -28,6 +27,6 @@ __all__ = [
     "run_matrix_op_l2_tiling",
     "run_vector_op_l2_tiling",
     "split_multi_head_attention",
-    "transpose_conv2d_weights",
+    "transpose_conv2d_inputs_and_weights",
     "transpose_linear_weights",
 ]
