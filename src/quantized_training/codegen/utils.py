@@ -987,7 +987,7 @@ def transpose_linear_weights(model: GraphModule, transpose_fc: bool = False):
         linear_transposed if transpose_fc else linear_transposed_without_fc
     )
 
-    for node in model.graph.nodes: 
+    for node in model.graph.nodes:
         if node.target not in [
             torch.ops.aten.linear.default,
             torch.ops.quantized_ops.linear_mx.default,
@@ -1096,6 +1096,7 @@ def replace_conv2d_with_im2col(model: GraphModule, unroll=16):
 
         param = model.get_parameter(weight_node.target)
         param.data = param.data.reshape(C_out, -1)
+        param.data = param.data.T # Transpose it so output is produced with channels in parallel
         weight_node.value = param.data
         weight_node.shape = param.data.shape
 
@@ -1103,6 +1104,7 @@ def replace_conv2d_with_im2col(model: GraphModule, unroll=16):
         if bias_node is not None:
             param = model.get_parameter(bias_node.target)
             param.data = param.data.reshape(C_out, 1)
+            param.data = param.data.T # Transpose it so output is produced with channels in parallel
             bias_node.value = param.data
 
         with model.graph.inserting_before(node):
@@ -1110,30 +1112,48 @@ def replace_conv2d_with_im2col(model: GraphModule, unroll=16):
                 torch.ops.aten.im2col.default,
                 (input_node, (kH, kW), dilation, padding, stride),
             )
+
+            transposed_in2col_node = model.graph.call_function(
+                torch.ops.aten.permute.default,
+                (in2col_node, (0, 2, 1))
+            )
+
             matmul_node = model.graph.call_function(
                 torch.ops.aten.matmul.default,
-                (weight_node, in2col_node),
+                (transposed_in2col_node, weight_node),
+                # (weight_node, in2col_node),
             )
             add_node = model.graph.call_function(
                 torch.ops.aten.add.Tensor,
                 (matmul_node, bias_node),
             )
+
+            permute_node = model.graph.call_function(
+                torch.ops.aten.permute.default,
+                (add_node, (0, 2, 1)),
+            )
+
             reshape_node = model.graph.call_function(
                 torch.ops.aten.reshape.default,
-                (add_node, (N, C_out, H_out, W_out)),
+                (permute_node, (N, C_out, H_out, W_out)),
             )
 
         in2col_node.meta = input_node.meta
+        transposed_in2col_node.meta = input_node.meta
         matmul_node.meta = node.meta
 
         propagate_shape(in2col_node)
+        propagate_shape(transposed_in2col_node)
         propagate_shape(matmul_node)
         propagate_shape(add_node)
+        propagate_shape(permute_node)
         propagate_shape(reshape_node)
 
         in2col_node.meta["source_fn_stack"] = [(in2col_node.name, in2col_node.target)]
+        transposed_in2col_node.meta["source_fn_stack"] = [(transposed_in2col_node.name, transposed_in2col_node.target)]
         matmul_node.meta["source_fn_stack"] = [(matmul_node.name, torch.matmul)]
         add_node.meta["source_fn_stack"] = [(add_node.name, "add")]
+        permute_node.meta["source_fn_stack"] = [(permute_node.name, "permute")]
         reshape_node.meta["source_fn_stack"] = [(reshape_node.name, "reshape")]
 
         node.replace_all_uses_with(reshape_node)
@@ -1361,7 +1381,7 @@ def run_matrix_op_l2_tiling(model, unroll, cache_size=DEFAULT_CACHE_SIZE):
     Args:
         model: A model object with a FX Graph containing GEMM nodes.
         cache_size (int): Total cache size in bytes.
-        unroll (int): Systolic array input and output channel unrolling dimension. 
+        unroll (int): Systolic array input and output channel unrolling dimension.
     """
     graph = model.graph
 
@@ -1513,7 +1533,7 @@ def get_tiled_shapes(input_shape, fix_last_dim=False, last_dim=-1, reverse=False
     """
     Yields tile shapes by progressively reducing from outermost to innermost (or reverse).
     Once a dimension is reduced to 1, it stays fixed. Last dim can be fixed optionally.
-    
+
     Args:
         input_shape (tuple): The original shape.
         fix_last_dim (bool): Whether to keep the last_dim fixed.
