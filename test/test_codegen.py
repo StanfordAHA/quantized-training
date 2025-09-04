@@ -128,6 +128,10 @@ if __name__ == "__main__":
     torch.set_printoptions(sci_mode=False, precision=10)
     torch.set_num_threads(32)
 
+    from huggingface_hub import login
+    print("Huggingface login...")
+    login(token=os.environ.get("HUGGINGFACE_HUB_TOKEN"))
+
     parser = argparse.ArgumentParser()
     parser.add_argument("model", default="resnet50")
     parser.add_argument(
