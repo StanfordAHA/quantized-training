@@ -128,9 +128,9 @@ if __name__ == "__main__":
     torch.set_printoptions(sci_mode=False, precision=10)
     torch.set_num_threads(32)
 
-    from huggingface_hub import login
-    print("Huggingface login...")
-    login(token=os.environ.get("HUGGINGFACE_HUB_TOKEN"))
+    # from huggingface_hub import login
+    # print("Huggingface login...")
+    # login(token=os.environ.get("HUGGINGFACE_HUB_TOKEN"))
 
     parser = argparse.ArgumentParser()
     parser.add_argument("model", default="resnet50")
@@ -570,8 +570,10 @@ if __name__ == "__main__":
 
         convert_pt2e(gm, args.bias)
 
-        orig_output, new_output = transform(gm, example_args, patterns=vector_stages)
+        transform(gm, example_args, **transform_args)
         compile(gm, example_args, **compile_args)
+        old_output = None
+        new_output = None 
     elif args.model == "mamba":
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
