@@ -12,6 +12,64 @@ from .mx_utils import _reshape_to_blocks, _shared_exponents
 # name is not too long
 quantized_decomposed_lib = Library("quantized_ops", "DEF")
 
+quantized_decomposed_lib.define(
+    "conv2d(Tensor input, Tensor weight, Tensor? bias=None, SymInt[2] stride=1, "
+    "SymInt[2] padding=0, SymInt[2] dilation=1, SymInt groups=1) -> Tensor"
+)
+
+@impl(quantized_decomposed_lib, "conv2d", "CompositeExplicitAutograd")
+def conv2d(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor = None,
+    stride: Union[int, Tuple[int]] = 1,
+    padding: Union[int, Tuple[int]] = 0,
+    dilation: Union[int, Tuple[int]] = 1,
+    groups: int = 1,
+) -> torch.Tensor:
+    return F.conv2d(
+        input, weight, bias, stride, padding, dilation, groups
+    )
+
+quantized_decomposed_lib.define(
+    "linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor"
+)
+
+@impl(quantized_decomposed_lib, "linear", "CompositeExplicitAutograd")
+def linear(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None) -> torch.Tensor:
+    return F.linear(input, weight, bias)
+
+quantized_decomposed_lib.define(
+    "max_pool2d(Tensor self, int[2] kernel_size, int[2] stride=[], int[2] padding=0, "
+    "int[2] dilation=1, bool ceil_mode=False) -> Tensor"
+)
+
+@impl(quantized_decomposed_lib, "max_pool2d", "CompositeExplicitAutograd")
+def max_pool2d(
+    self: torch.Tensor,
+    kernel_size: Union[int, Tuple[int]] = 1,
+    stride: Union[int, Tuple[int]] = None,
+    padding: Union[int, Tuple[int]] = 0,
+    dilation: Union[int, Tuple[int]] = 1,
+    ceil_mode: bool = False,
+) -> torch.Tensor:
+    return F.max_pool2d(
+        self.permute(0, 3, 1, 2),
+        kernel_size,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        ceil_mode=ceil_mode,
+    ).permute(0, 2, 3, 1)
+
+quantized_decomposed_lib.define(
+    "adaptive_avg_pool2d(Tensor self, SymInt[2] output_size) -> Tensor"
+)
+
+@impl(quantized_decomposed_lib, "adaptive_avg_pool2d", "CompositeExplicitAutograd")
+def adaptive_avg_pool2d(self: torch.Tensor, output_size: Union[int, Tuple[int]] = 1) -> torch.Tensor:
+    return F.adaptive_avg_pool2d(self.permute(0, 3, 1, 2), output_size).permute(0, 2, 3, 1)
+
 def expand(input, shape, block_size):
     while input.ndim < len(shape):
         input = input.unsqueeze(0)
@@ -50,7 +108,8 @@ def vmap(input: torch.Tensor, code: torch.Tensor, chunk_size=65536) -> torch.Ten
 
 
 quantized_decomposed_lib.define(
-    "quantize(Tensor input, Tensor scale, str? dtype, Tensor code, int? block_size=None) -> Tensor"
+    "quantize(Tensor input, Tensor scale, str? dtype, Tensor code, int? block_size=None, "
+    "Tensor quant_code=None) -> Tensor"
 )
 
 
@@ -61,6 +120,7 @@ def quantize(
     dtype: Optional[str],
     code: torch.Tensor,
     block_size: Optional[int] = None,
+    quant_code: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """ Affine quantization for the Tensor using the same quantization parameters to map
     from floating point to quantized values
@@ -271,7 +331,7 @@ def calculate_mx_qparam(
 
 quantized_decomposed_lib.define(
     "quantize_mx(Tensor self, int axis, float quant_max, int block_size, str dtype, Tensor code, "
-    "bool force_scale_power_of_two=False, Tensor scale_code=None) -> (Tensor, Tensor)"
+    "bool force_scale_power_of_two=False, Tensor scale_code=None, Tensor quant_code=None) -> (Tensor, Tensor)"
 )
 
 
@@ -285,9 +345,116 @@ def quantize_mx(
     code: torch.Tensor,
     force_scale_power_of_two: bool = False,
     scale_code: Optional[torch.Tensor] = None,
+    quant_code: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor]:
     scale = calculate_mx_qparam(
-        input, axis, quant_max, block_size, force_scale_power_of_two, scale_code
+        input,
+        axis=axis,
+        quant_max=quant_max,
+        block_size=block_size,
+        force_scale_power_of_two=force_scale_power_of_two,
+        code=scale_code,
     )
     input = quantize(input, scale, dtype, code, block_size)
     return scale, input
+
+
+def to_csr(tensor: torch.Tensor):
+    assert not tensor.is_sparse, "Expected a dense tensor (not PyTorch's sparse format)"
+
+    tensor = tensor.reshape(-1, tensor.shape[-1])
+    rows, cols = tensor.shape
+    data = []
+    indices = []
+    indptr = [0]
+
+    nnz = 0
+    for row in range(rows):
+        row_data = tensor[row]
+        for col in range(cols):
+            val = row_data[col].item()
+            if val != 0:
+                data.append(val)
+                indices.append(col)
+                nnz += 1
+        indptr.append(nnz)
+
+    data = torch.tensor(data, dtype=tensor.dtype)
+    indices = torch.tensor(indices, dtype=torch.int32)
+    indptr = torch.tensor(indptr, dtype=torch.int32)
+
+    return data, indices, indptr
+
+
+quantized_decomposed_lib.define(
+    "filter_outlier(Tensor input, float threshold=6.0) -> (Tensor, Tensor, Tensor, Tensor)"
+)
+
+
+@impl(quantized_decomposed_lib, "filter_outlier", "CompositeExplicitAutograd")
+def filter_outlier(input: torch.Tensor, threshold: float = 6.0) -> Tuple[torch.Tensor]:
+    """Filter out outliers in the input tensor based on a threshold.
+
+    Args:
+        input (torch.Tensor): Input tensor.
+        threshold (float): Threshold for filtering out outliers.
+
+    Returns:
+        torch.Tensor: Filtered tensor.
+    """
+    is_outlier = torch.abs(input) > threshold
+    inlier = torch.where(is_outlier, 0, input)
+    outliers = torch.where(is_outlier, input, 0)
+    csr = to_csr(outliers)
+    return inlier, *csr
+
+
+quantized_decomposed_lib.define(
+    "spmm_csr(Tensor data, Tensor indices, Tensor indptr, Tensor B, Tensor? B_scale=None, "
+    "Tensor? B_code=None, int? block_size=None, bool weight_transposed=False) -> Tensor"
+)
+
+
+@impl(quantized_decomposed_lib, "spmm_csr", "CompositeExplicitAutograd")
+def spmm_csr(
+    data: torch.Tensor,
+    indices: torch.Tensor,
+    indptr: torch.Tensor,
+    B: torch.Tensor,
+    B_scale: Optional[torch.Tensor] = None,
+    B_code: Optional[torch.Tensor] = None,
+    block_size: Optional[int] = None,
+    weight_transposed=False
+) -> torch.Tensor:
+    """
+    Performs SpMM: Y = A @ B where A is in CSR format.
+
+    Args:
+        data    : 1D tensor of non-zero values in A (shape [nnz])
+        indices : 1D tensor of column indices for each non-zero value (shape [nnz])
+        indptr  : 1D tensor of row pointers (shape [num_rows + 1])
+        B       : Dense matrix of shape [K, N]
+
+    Returns:
+        Y       : Dense matrix of shape [M, K]
+    """
+    M = indptr.numel() - 1
+    K = B.shape[1] if weight_transposed else B.shape[0]
+    Y = torch.zeros((M, K), dtype=data.dtype, device=data.device)
+
+    if B_code is not None:
+        B = B_code[B.to(torch.long)]
+    if B_scale is not None:
+        B = B * expand(B_scale, B.shape, block_size)
+
+    if weight_transposed:
+        B = B.T
+
+    for row in range(M):
+        start = indptr[row].item()
+        end = indptr[row + 1].item()
+        for i in range(start, end):
+            col = indices[i].item()
+            Y[row] += data[i] * B[:,col]
+
+    return Y
