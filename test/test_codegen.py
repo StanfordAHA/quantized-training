@@ -76,7 +76,7 @@ task_to_keys = {
 vector_stages = [
     [
         ["gemm"],
-        ["dequantize"],
+        # ["dequantize"],
         ["add", "sub", "mul", "div"],
         # ["exp", "abs", "relu", "gelu", "tanh", "silu", "vmap"],
         ["exp", "abs", "relu", "tanh", "silu", "vmap"],
@@ -575,6 +575,33 @@ if __name__ == "__main__":
         compile(gm, example_args, **compile_args)
         old_output = None
         new_output = None
+    elif args.model == "fakegemm":
+        class SimpleGemm(torch.nn.Module):
+            def __init__(self, in_features, out_features):
+                super(SimpleGemm, self).__init__()
+                # Exclude bias for simplicity
+                self.linear = torch.nn.Linear(in_features, out_features, bias=False)
+                torch.nn.init.kaiming_uniform_(self.linear.weight, a=0, mode='fan_in', nonlinearity='relu')
+
+            def forward(self, x):
+                return self.linear(x)
+
+        model = SimpleGemm(64, 32).eval().bfloat16()
+
+        example_args = (torch.randn(3364, 64, dtype=torch_dtype),)
+        gm = prepare_pt2e(model, quantizer, example_args)
+
+        for _ in range(2):
+            with torch.no_grad():
+                gm(*example_args)
+
+        convert_pt2e(gm, args.bias)
+
+        transform(gm, example_args, **transform_args)
+        compile(gm, example_args, **compile_args)
+        old_output = None
+        new_output = None
+
     elif args.model == "mamba":
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
