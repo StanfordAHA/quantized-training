@@ -76,7 +76,7 @@ task_to_keys = {
 vector_stages = [
     [
         ["gemm"],
-        # ["dequantize"],
+        ["dequantize"],
         ["add", "sub", "mul", "div"],
         # ["exp", "abs", "relu", "gelu", "tanh", "silu", "vmap"],
         ["exp", "abs", "relu", "tanh", "silu", "vmap"],
