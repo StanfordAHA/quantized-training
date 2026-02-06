@@ -73,22 +73,6 @@ task_to_keys = {
 }
 
 
-vector_stages = [
-    [
-        ["gemm"],
-        ["dequantize"],
-        ["add", "sub", "mul", "div"],
-        # ["exp", "abs", "relu", "gelu", "tanh", "silu", "vmap"],
-        ["exp", "abs", "relu", "tanh", "silu", "vmap"],
-        ["add", "mul", "div"],
-        # ["div", "quantize"],
-    ],
-    [
-        ["layer_norm", "softmax"],
-        # ["quantize"],
-    ]
-]
-
 
 def get_llm_qscheme(bs=64, threshold=None):
     outlier = f",outlier={threshold}" if threshold is not None else ""
@@ -247,6 +231,26 @@ if __name__ == "__main__":
     )
 
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
+
+    vector_stages = [
+        [
+            ["gemm"],
+            ["dequantize"],
+            ["add", "sub", "mul", "div"],
+            # ["exp", "abs", "relu", "gelu", "tanh", "silu", "vmap"],
+            ["exp", "abs", "relu", "tanh", "silu", "vmap"],
+            ["add", "mul", "div"],
+            # ["div", "quantize"],
+        ],
+        [
+            ["layer_norm", "softmax"],
+            # ["quantize"],
+        ]
+    ]
+
+    # Add ["div, quantize"] to vector_stages if running resnet
+    if args.model in ["resnet18", "resnet50"]:
+        vector_stages[0].append(["div", "quantize"])
 
     transform_args = {
         "patterns": vector_stages,
