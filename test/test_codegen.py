@@ -238,7 +238,7 @@ if __name__ == "__main__":
             ["dequantize"],
             ["add", "sub", "mul", "div"],
             # ["exp", "abs", "relu", "gelu", "tanh", "silu", "vmap"],
-            ["exp", "abs", "relu", "tanh", "silu", "vmap"],
+            ["exp", "abs", "relu", "tanh", "vmap"],
             ["add", "mul", "div"],
             # ["div", "quantize"],
         ],
