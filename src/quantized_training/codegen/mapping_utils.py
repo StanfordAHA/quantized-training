@@ -190,12 +190,12 @@ def convert_arg(value, output_dir=None) -> Argument:
             arg.tensor_list.tensors.extend([
                 Tensor(node=f"{value.name}_{i}") for i in range(len(value.value))
             ])
+    elif isinstance(value, bool):
+        arg.bool_value = value
     elif isinstance(value, int):
         arg.int_value = value
     elif isinstance(value, float):
         arg.float_value = value
-    elif isinstance(value, bool):
-        arg.bool_value = value
     elif isinstance(value, str):
         arg.str_value = value
     elif isinstance(value, (
@@ -208,10 +208,10 @@ def convert_arg(value, output_dir=None) -> Argument:
                 convert_arg(x).tensor if x is not None else Tensor(is_none=True)
                 for x in value
             ])
-        elif all(isinstance(x, int) for x in value):
-            arg.int_list.values.extend(value)
         elif all(isinstance(x, bool) for x in value):
             arg.bool_list.values.extend(value)
+        elif all(isinstance(x, int) for x in value):
+            arg.int_list.values.extend(value)
         elif all(isinstance(x, (int, float, bool)) for x in value):
             arg.scalar_list.values.extend(value)
         else:
