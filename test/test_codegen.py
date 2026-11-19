@@ -42,6 +42,7 @@ from quantized_training.codegen.utils import (
 
 from utils.models import (
     bert,
+    mamba2,
     mobilebert,
     torchvision_models,
     vit
@@ -634,6 +635,34 @@ if __name__ == "__main__":
         new_output = gm(input_ids, False, False)[0]
 
         compile(gm, example_args, example_kwargs, **compile_args)
+    elif args.model == "mamba2_prefill":
+        model, tokenizer = mamba2.load_model(args)
+
+        if args.remove_duplicate:
+            model.backbone.layers = model.backbone.layers[:1]
+
+        test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
+        input_ids = encodings.input_ids[:, :args.context_length]
+
+        inputs_embeds = model.backbone.embeddings(input_ids)
+        example_args = (inputs_embeds,)
+
+        gm = prepare_pt2e(mamba2.Mamba2Prefill(model), quantizer, example_args)
+
+        example_input = torch.randn(1, 128, model.config.hidden_size, dtype=model.dtype)
+        replace_rmsnorm_with_layer_norm(gm, model.backbone.layers[0].norm, (example_input,))
+
+        convert_pt2e(gm, args.bias)
+
+        old_output = gm(*example_args)
+
+        transform(gm, example_args, **transform_args)
+        gm.graph.print_tabular()
+
+        new_output = gm(*example_args)
+
+        compile(gm, example_args, **compile_args)
     else:
         raise ValueError(f"Model {args.model} not supported")
 
