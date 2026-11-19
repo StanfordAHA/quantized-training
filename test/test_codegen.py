@@ -43,11 +43,13 @@ from quantized_training.codegen.utils import (
 
 from utils.models import (
     bert,
+    gcn,
     mobilebert,
     torchvision_models,
     vit
 )
 from utils.dataset import (
+    citeseer,
     glue,
     imagenet
 )
@@ -556,6 +558,27 @@ if __name__ == "__main__":
         new_output = gm(input_ids, False, False)[0]
 
         compile(gm, example_args, example_kwargs, **compile_args)
+    elif args.model == "gcn":
+        model = gcn.load_model(args)
+        citeseer_dataset = {
+            k: v.to(torch_dtype) if v.is_floating_point() else v
+            for k, v in citeseer.retrieve_dataset().items()
+        }
+
+        # 372/500 is the bf16 test accuracy of cgra_sparse_ml_bench's ssp
+        # reproduce_CiteSeer.sh run that the weights come from.
+        if gcn.evaluate(model, citeseer_dataset) != 372:
+            print("WARNING: bf16 GCN does not reproduce ssp's 372/500 test accuracy")
+
+        gm, old_output, new_output = gcn.quantize_and_dump_model(
+            model=model,
+            quantizer=quantizer,
+            dataset=citeseer_dataset,
+            vector_stages=vector_stages,
+            args=args
+        )
+
+        gcn.evaluate(gm, citeseer_dataset)
     else:
         raise ValueError(f"Model {args.model} not supported")
 
