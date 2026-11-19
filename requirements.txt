@@ -15,3 +15,4 @@ tabulate
 protobuf
 graphviz
 timm
+torch_geometric==2.3.1
