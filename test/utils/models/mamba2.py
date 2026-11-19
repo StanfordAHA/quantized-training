@@ -162,11 +162,9 @@ class Mamba2Scan(nn.Module):
       4. State passing:     entering^T[k+1] = exp(sum of a over chunk k)
                             * entering^T[k] + state^T[k], entering^T[0] = 0
       5. C@states, per group: Y_off = exp(a_cum) * (C @ entering^T)   [Q, Hg*P]
-    ``a_cum`` is the running sum of ``a`` within the chunk. As in the official
-    Triton kernels, ``decay[l, s] = exp(a_cum[l] - a_cum[s])`` (the decay from
-    source position s to output position l) for ``l >= s``; an additive causal
-    mask, -inf above the diagonal, makes it 0 there. ``decay_to_end[s] =
-    exp(a_cum[Q-1] - a_cum[s])``. Steps 1 and 3 read separate copies of B^T,
+    ``decay[l, s] = exp(a[s+1] + ... + a[l])`` for ``l >= s`` and 0 above the
+    diagonal. ``decay_to_end`` is its last row and ``a_cum`` the running sum
+    of ``a`` within the chunk. Steps 1 and 3 read separate copies of B^T,
     because step 1 MX-quantizes it along the states and step 3 along the
     positions. The states stay transposed from step 3 to step 5, so neither X
     nor the states are transposed for a GEMM.
@@ -185,10 +183,14 @@ class Mamba2Scan(nn.Module):
         self.register_buffer(
             "decay_rate", -mixer.A_log.detach().float().exp().to(dtype), persistent=False
         )
-        # Added to the exponent of the decay: 0 where l >= s, -inf above the diagonal.
         self.register_buffer(
-            "causal_bias",
-            torch.full((chunk_size, chunk_size), float("-inf"), dtype=dtype).triu(1),
+            "strict_lower_mask",
+            torch.ones(chunk_size, chunk_size, dtype=dtype).tril(-1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "lower_mask",
+            torch.ones(chunk_size, chunk_size, dtype=dtype).tril(0),
             persistent=False,
         )
         self.register_buffer(
@@ -233,14 +235,15 @@ class Mamba2Scan(nn.Module):
         C = group_major(C.reshape(batch, K, Q, G, S))                     # [N, K, G, Q, S]
 
         # decay[l, s]: row l is the output position, column s the source.
-        decay = torch.exp(a_cum[..., :, None] - a_cum[..., None, :] + self.causal_bias)  # [N, K, G, Hg, Q, Q]
+        segment_sum = torch.cumsum(a[..., :, None] * self.strict_lower_mask, dim=-2)
+        decay = torch.exp(segment_sum) * self.lower_mask                 # [N, K, G, Hg, Q, Q]
 
         # 1. C@B^T and 2. score@x
         scores = torch.matmul(C, B_t_scores)                              # [N, K, G, Q, Q]
         y_diag = torch.matmul(scores[:, :, :, None] * decay, X)           # [N, K, G, Hg, Q, P]
 
         # 3. B@X as B^T @ X_end, with X_end position-major [Q, Hg*P]
-        decay_to_end = torch.exp(a_cum[..., -1:] - a_cum).transpose(-1, -2)  # [N, K, G, Q, Hg]
+        decay_to_end = decay[..., -1, :].transpose(-1, -2)               # [N, K, G, Q, Hg]
         X_end = group_major(xdt.reshape(batch, K, Q, G, Hg * P)).reshape(batch, K, G, Q, Hg, P)
         X_end = (X_end * decay_to_end[..., None]).reshape(batch, K, G, Q, Hg * P)
         chunk_states_t = torch.matmul(B_t_states, X_end).reshape(batch, K, G, S, Hg, P)
