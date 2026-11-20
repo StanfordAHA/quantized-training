@@ -252,13 +252,32 @@ def split_multi_head_attention(model: GraphModule):
             bt = list(nn_module_stack.values())[-1]
             grouped_nodes[bt[0]].append(node)
 
+    # Annotate the dtype of the new nodes in the graph
+    def propagate_input_dtype(node):
+        if (dtype := node.meta.get('dtype', None)) is None:
+            return
+        for user in node.users:
+            if user.target == torch.ops.aten.select.int:
+                user.meta['dtype'] = dtype
+                propagate_input_dtype(user)
+
     for nodes in grouped_nodes.values():
         if len(nodes) != 2:
             for node in nodes:
                 if node.target == torch.ops.aten.matmul.default:
                     _decompose_bmm(model, node)
                 else:
+                    # The per-batch selects of the MX operands keep the operands' dtypes
+                    operands = [
+                        node.args[0],
+                        node.args[1],
+                        node.kwargs.get('input_scale', None),
+                        node.kwargs.get('weight_scale', None),
+                    ]
                     _decompose_bmm_mx(model, node)
+                    for operand in operands:
+                        if operand is not None:
+                            propagate_input_dtype(operand)
             continue
 
         qk_matmul, av_matmul = nodes[0], nodes[1]
@@ -308,15 +327,6 @@ def split_multi_head_attention(model: GraphModule):
         # Sort the nodes between the qk and av matmuls
         order = {node: idx for idx, node in enumerate(graph.nodes)}
         nodes_between = sorted(nodes_between, key=lambda n: order[n])
-
-        # Annotate the dtype of the new nodes in the graph
-        def propagate_input_dtype(node):
-            if (dtype := node.meta.get('dtype', None)) is None:
-                return
-            for user in node.users:
-                if user.target == torch.ops.aten.select.int:
-                    user.meta['dtype'] = dtype
-                    propagate_input_dtype(user)
 
         def propagate_output_dtype(orig_node, new_node):
             if (dtype := orig_node.meta.get('dtype', None)) is None:
