@@ -270,10 +270,11 @@ class Mamba2Prefill(nn.Module):
     """A cache-free prefill over a transformers ``Mamba2ForCausalLM``'s modules.
 
     Registers the model's backbone and head without copying weights, one
-    ``Mamba2Scan`` per layer, and per layer two linears that split ``in_proj``
-    by output rows: ``z_proj`` (the gate z) and ``xBCdt_proj`` (xBC and dt).
-    Their weights are copies of the matching ``in_proj`` rows, so the results
-    equal ``in_proj``'s; ``in_proj`` itself is left in place and unused.
+    ``Mamba2Scan`` per layer, and per layer three linears that split
+    ``in_proj`` by output rows: ``z_proj`` (the gate z), ``xBC_proj`` (the
+    conv input xBC) and ``dt_proj`` (dt). Their weights are copies of the
+    matching ``in_proj`` rows, so the results equal ``in_proj``'s; ``in_proj``
+    itself is left in place and unused.
     ``forward`` takes ``[N, L, hidden]`` embeddings and returns ``[N, L, vocab]``
     logits. Every block runs its RMSNorm, the mixer written out by
     ``mixer_forward`` and the residual add, all in the dtype of the embeddings;
@@ -304,24 +305,35 @@ class Mamba2Prefill(nn.Module):
             scans.append(Mamba2Scan(mixer, chunk_size))
         self.scans = nn.ModuleList(scans)
 
-        # in_proj split by output rows: z, then xBC and dt.
-        z_projs, xBCdt_projs = [], []
+        # in_proj split by output rows: z, then xBC, then dt.
+        z_projs, xBC_projs, dt_projs = [], [], []
         for block in self.backbone.layers:
             mixer = block.mixer
             if mixer.in_proj.bias is not None:
                 raise ValueError("[ERROR] Mamba2 export splits in_proj by rows and expects no bias.")
             weight = mixer.in_proj.weight
             hidden, rows = weight.shape[1], weight.shape[0]
+            z_end = mixer.intermediate_size
+            xBC_end = z_end + mixer.conv_dim
+            if rows != xBC_end + mixer.num_heads:
+                raise ValueError(
+                    f"[ERROR] Mamba2 export expects in_proj rows z, xBC, dt = {xBC_end + mixer.num_heads}, "
+                    f"got {rows}."
+                )
             factory = dict(bias=False, device=weight.device, dtype=weight.dtype)
-            z_proj = nn.Linear(hidden, mixer.intermediate_size, **factory)
-            xBCdt_proj = nn.Linear(hidden, rows - mixer.intermediate_size, **factory)
+            z_proj = nn.Linear(hidden, z_end, **factory)
+            xBC_proj = nn.Linear(hidden, mixer.conv_dim, **factory)
+            dt_proj = nn.Linear(hidden, mixer.num_heads, **factory)
             with torch.no_grad():
-                z_proj.weight.copy_(weight[: mixer.intermediate_size])
-                xBCdt_proj.weight.copy_(weight[mixer.intermediate_size :])
+                z_proj.weight.copy_(weight[:z_end])
+                xBC_proj.weight.copy_(weight[z_end:xBC_end])
+                dt_proj.weight.copy_(weight[xBC_end:])
             z_projs.append(z_proj)
-            xBCdt_projs.append(xBCdt_proj)
+            xBC_projs.append(xBC_proj)
+            dt_projs.append(dt_proj)
         self.z_projs = nn.ModuleList(z_projs)
-        self.xBCdt_projs = nn.ModuleList(xBCdt_projs)
+        self.xBC_projs = nn.ModuleList(xBC_projs)
+        self.dt_projs = nn.ModuleList(dt_projs)
 
         # Zeros before position 0 of the causal conv, shared by all layers (batch size 1).
         mixer = self.backbone.layers[0].mixer
@@ -331,19 +343,20 @@ class Mamba2Prefill(nn.Module):
             persistent=False,
         )
 
-    def mixer_forward(self, mixer, scan, z_proj, xBCdt_proj, hidden_states):
+    def mixer_forward(self, mixer, scan, z_proj, xBC_proj, dt_proj, hidden_states):
         """Return one Mamba2 mixer's output for ``[N, L, hidden]`` inputs.
 
-        Steps: the gate silu(z) from z_proj; xBCdt_proj split into xBC and dt;
-        causal conv1d + SiLU on xBC; split into x, B, C; dt = softplus(dt +
-        dt_bias); the chunked scan; the D skip term; the gated grouped RMSNorm
-        norm(y * silu(z)); out_proj.
+        Steps: the gate silu(z) from z_proj; xBC from xBC_proj and dt from
+        dt_proj; causal conv1d + SiLU on xBC; split into x, B, C; dt =
+        softplus(dt + dt_bias); the chunked scan; the D skip term; the gated
+        grouped RMSNorm norm(y * silu(z)); out_proj.
         """
         batch, length, _ = hidden_states.shape
         groups_states = mixer.n_groups * mixer.ssm_state_size
 
         gate = F.silu(z_proj(hidden_states))
-        xBC, dt = xBCdt_proj(hidden_states).split([mixer.conv_dim, mixer.num_heads], dim=-1)
+        xBC = xBC_proj(hidden_states)
+        dt = dt_proj(hidden_states)
         xBC = causal_depthwise_conv1d_silu(
             xBC, mixer.conv1d.weight.squeeze(1), mixer.conv1d.bias, self.conv_zero_prefix
         )
@@ -369,11 +382,11 @@ class Mamba2Prefill(nn.Module):
 
     def forward(self, inputs_embeds):
         hidden_states = inputs_embeds
-        layers = zip(self.backbone.layers, self.scans, self.z_projs, self.xBCdt_projs)
-        for block, scan, z_proj, xBCdt_proj in layers:
+        layers = zip(self.backbone.layers, self.scans, self.z_projs, self.xBC_projs, self.dt_projs)
+        for block, scan, z_proj, xBC_proj, dt_proj in layers:
             residual = hidden_states
             hidden_states = self.mixer_forward(
-                block.mixer, scan, z_proj, xBCdt_proj, block.norm(hidden_states)
+                block.mixer, scan, z_proj, xBC_proj, dt_proj, block.norm(hidden_states)
             )
             hidden_states = residual + hidden_states
         hidden_states = self.backbone.norm_f(hidden_states)
