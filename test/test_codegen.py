@@ -606,6 +606,67 @@ if __name__ == "__main__":
         old_output = None
         new_output = None
 
+    elif args.model.startswith("gin_pred"):
+        # GIN (COLLAB) prediction_layer<i>/linear_trans: X = B @ C, B = input (64 x K), C = weight (K x 3).
+        # Real bf16 tensors from the sparse-ml GIN dataset, bundled in test/gin_collab/ (uint16 bf16 bits).
+        # INT8 per-tensor symmetric quantization (INT8_FLAGS): the GEMM runs on the MU as plain int8 x int8
+        # (op target "linear", not "linear_mx" -> is_mx_op = false), the dequantize (x * s_B * s_C) on the CGRA.
+        import numpy as np
+        gin_layer = int(args.model[len("gin_pred"):])
+        # Bundled copy of the dataset tensors (uint16 bf16 bit patterns) next to this file; GIN_DATA_DIR overrides.
+        gin_root = os.environ.get("GIN_DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "gin_collab"))
+        gin_dir = os.path.join(gin_root, f"prediction_layer{gin_layer}", "linear_trans")
+
+        def load_gin_bf16(name):
+            a = np.load(os.path.join(gin_dir, name))
+            if a.dtype == np.uint16:   # bf16 bit patterns (bundled data)
+                u = a.astype(np.uint32)
+            else:                      # sparse-ml format: 16-character bit strings
+                u = np.array([int(v, 2) for v in a.flatten()], dtype=np.uint32).reshape(a.shape)
+            return torch.from_numpy((u << 16).view(np.float32)).to(torch.bfloat16)
+
+        gin_B = load_gin_bf16("B.npy")
+        gin_C = load_gin_bf16("C.npy")
+        print(f"GIN prediction_layer{gin_layer} linear_trans: B {tuple(gin_B.shape)}, C {tuple(gin_C.shape)}")
+        # Pad N (3 output columns) with zero weight columns to the MU OC unroll (32) before quantization.
+        # Left to the compiler, pad_gemm_inputs_to_hardware_unroll_size pads the weight the same way but inserts a
+        # slice (32 -> 3) after the GEMM, which splits the dequantize off into a separate fused op (dequantize +
+        # slice) so the MU layer no longer carries the per-tensor dequantize scale (unlike fakegemm/resnet18).
+        # Zero columns do not change max|C|, so the per-tensor weight scale is unchanged. K is left to the compiler.
+        gin_oc_unroll = int(os.environ.get("GIN_OC_PAD", "32"))
+        gin_n_pad = (-gin_C.shape[1]) % gin_oc_unroll
+        if gin_n_pad:
+            gin_C = torch.nn.functional.pad(gin_C, (0, gin_n_pad))
+            print(f"GIN: padded C to {tuple(gin_C.shape)} (zero columns)")
+
+        class GinFinalTrans(torch.nn.Module):
+            def __init__(self, weight_kn):
+                super().__init__()
+                self.linear = torch.nn.Linear(weight_kn.shape[0], weight_kn.shape[1], bias=False)
+                with torch.no_grad():
+                    self.linear.weight.copy_(weight_kn.t().contiguous())
+
+            def forward(self, x):
+                return self.linear(x)
+
+        model = GinFinalTrans(gin_C).eval().bfloat16()
+
+        example_args = (gin_B,)
+        gm = prepare_pt2e(model, quantizer, example_args)
+
+        # Two calibration passes (the amax observer uses the history from the previous pass), as in fakegemm:
+        # scale = max|x| / 127 per tensor.
+        for _ in range(2):
+            with torch.no_grad():
+                gm(*example_args)
+
+        convert_pt2e(gm, args.bias)
+
+        transform(gm, example_args, **transform_args)
+        compile(gm, example_args, **compile_args)
+        old_output = None
+        new_output = None
+
     elif args.model == "mamba":
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
