@@ -82,7 +82,13 @@ def quantize_and_dump_model(model, quantizer, dataset, vector_stages, args):
     example_args = _inputs(dataset, device)
     gm = prepare_pt2e(model.to(device), quantizer, example_args)
 
-    # Microscaling scales are computed from each tensor on the fly: no calibration needed.
+    # Calibrate per-tensor scales on the whole graph, which is exactly what inference quantizes.
+    # Two passes: the amax observer sets each pass's scale from earlier passes only, so one pass
+    # leaves scale = 1.0. Microscaling scales ignore calibration.
+    with torch.no_grad():
+        for _ in range(2):
+            gm(*example_args)
+
     convert_pt2e(gm, args.bias)
 
     old_output = gm(*example_args)
