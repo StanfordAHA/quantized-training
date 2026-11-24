@@ -44,12 +44,14 @@ from quantized_training.codegen.utils import (
 from utils.models import (
     bert,
     gcn,
+    gin,
     mobilebert,
     torchvision_models,
     vit
 )
 from utils.dataset import (
     citeseer,
+    collab,
     glue,
     imagenet
 )
@@ -579,6 +581,24 @@ if __name__ == "__main__":
         )
 
         gcn.evaluate(gm, citeseer_dataset)
+    elif args.model == "gin":
+        model = gin.load_model(args)
+        collab_dataset = collab.retrieve_dataset(dtype=torch_dtype)
+
+        # 401/500 is the bf16 (custom ops) test accuracy of cgra_sparse_ml_bench's
+        # powerful-gnns reproduce_COLLAB.sh run that the weights come from.
+        if gin.evaluate(model, collab_dataset) != 401:
+            print("WARNING: bf16 GIN does not reproduce powerful-gnns' 401/500 test accuracy")
+
+        gm, old_output, new_output = gin.quantize_and_dump_model(
+            model=model,
+            quantizer=quantizer,
+            dataset=collab_dataset,
+            vector_stages=vector_stages,
+            args=args
+        )
+
+        gin.evaluate(gm, collab_dataset)
     else:
         raise ValueError(f"Model {args.model} not supported")
 
