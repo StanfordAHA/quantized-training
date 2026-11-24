@@ -46,10 +46,12 @@ from utils.models import (
     gcn,
     gin,
     mobilebert,
+    spcnn,
     torchvision_models,
     vit
 )
 from utils.dataset import (
+    cifar10,
     citeseer,
     collab,
     glue,
@@ -599,6 +601,25 @@ if __name__ == "__main__":
         )
 
         gin.evaluate(gm, collab_dataset)
+    elif args.model == "spcnn":
+        model = spcnn.load_model(args)
+        cifar10_dataset = cifar10.retrieve_dataset(dtype=torch_dtype)
+
+        # 9204/10000 is the bf16 test accuracy of cgra_sparse_ml_bench sparse-cnn's procedure
+        # (bf16, then BN folded into the convs) on all 10k test images; sparse-cnn itself only runs
+        # one 32-image batch.
+        if spcnn.evaluate(model, cifar10_dataset) != 9204:
+            print("WARNING: bf16 SpCNN does not reproduce sparse-cnn's 9204/10000 test accuracy")
+
+        gm, old_output, new_output = spcnn.quantize_and_dump_model(
+            model=model,
+            quantizer=quantizer,
+            dataset=cifar10_dataset,
+            vector_stages=vector_stages,
+            args=args
+        )
+
+        spcnn.evaluate(gm, cifar10_dataset)
     else:
         raise ValueError(f"Model {args.model} not supported")
 
