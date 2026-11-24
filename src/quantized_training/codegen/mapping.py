@@ -439,6 +439,12 @@ def update_submodule_user(model, node):
         placeholders = [n for n in mod.graph.nodes if n.op == 'placeholder']
         placeholder = placeholders[index]
 
+        # A node inside the submodule may already have this name, e.g. the fused GEMM that the
+        # renamed producer's new name was taken from. Give it a fresh one so names stay unique.
+        clash = next((n for n in mod.graph.nodes if n is not placeholder and n.name == node.name), None)
+        if clash is not None:
+            clash.name = get_new_node_name_with_prefix(node.name)(mod)
+
         placeholder.name = node.name
         placeholder.meta['source_node'] = node
     model.graph.lint()
